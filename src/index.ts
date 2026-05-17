@@ -16,25 +16,46 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { createAuditEvent, writeAuditEvent } from "./audit-log.js";
 import { CanvasClient } from "./canvas-client.js";
+import { renderBrandedPage, type BrandedPageInput } from "./html-template.js";
+import {
+  dryRunResult,
+  enforceSafety,
+  isKnownTool,
+  normalizeToolArguments,
+  parseSafetyConfig,
+  resolveCanvasToken,
+  type SafetyConfig,
+} from "./safety.js";
 
 // -----------------------------------------------------------------------
 // Bootstrap the Canvas client from environment variables
 // -----------------------------------------------------------------------
 
 const CANVAS_BASE_URL = process.env.CANVAS_BASE_URL ?? "";
-const CANVAS_API_TOKEN = process.env.CANVAS_API_TOKEN ?? "";
+let safetyConfig: SafetyConfig;
 
-if (!CANVAS_BASE_URL || !CANVAS_API_TOKEN) {
+try {
+  safetyConfig = parseSafetyConfig(process.env);
+} catch (err) {
+  const message = err instanceof Error ? err.message : String(err);
+  console.error(`[canvas-mcp] ERROR: ${message}`);
+  process.exit(1);
+}
+
+const hasCanvasToken = Boolean(
+  safetyConfig.defaultToken || (safetyConfig.tokenMap && Object.keys(safetyConfig.tokenMap).length > 0)
+);
+
+if (!CANVAS_BASE_URL || !hasCanvasToken) {
   console.error(
-    "[canvas-mcp] ERROR: CANVAS_BASE_URL and CANVAS_API_TOKEN must be set.\n" +
+    "[canvas-mcp] ERROR: CANVAS_BASE_URL and CANVAS_API_TOKEN or CANVAS_API_TOKENS must be set.\n" +
     "  export CANVAS_BASE_URL=https://yourschool.instructure.com\n" +
     "  export CANVAS_API_TOKEN=your_token_here"
   );
   process.exit(1);
 }
-
-const canvas = new CanvasClient({ baseUrl: CANVAS_BASE_URL, token: CANVAS_API_TOKEN });
 
 // -----------------------------------------------------------------------
 // MCP Server
@@ -44,6 +65,22 @@ const server = new Server(
   { name: "canvas-mcp", version: "1.0.0" },
   { capabilities: { tools: {} } }
 );
+
+const WRITE_SAFETY_PROPERTIES = {
+  dry_run: {
+    type: "boolean",
+    description: "Validate the write request and return the planned action without calling Canvas.",
+  },
+  confirm: {
+    type: "boolean",
+    description: "Set to true when CANVAS_REQUIRE_CONFIRMATION is enabled and you intend to mutate Canvas.",
+  },
+  confirmation: {
+    type: "string",
+    enum: ["CONFIRM"],
+    description: "Alternative explicit confirmation token for production write tools.",
+  },
+};
 
 // -----------------------------------------------------------------------
 // Tool definitions
@@ -268,6 +305,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "boolean",
             description: "Publish the final grade when this module is completed.",
           },
+          ...WRITE_SAFETY_PROPERTIES,
         },
         required: ["course_id", "name"],
       },
@@ -332,6 +370,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "number",
             description: "Minimum score (only used when completion_requirement_type is min_score).",
           },
+          ...WRITE_SAFETY_PROPERTIES,
         },
         required: ["course_id", "module_id", "type"],
       },
@@ -375,6 +414,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description: "ISO 8601 datetime to auto-publish the page.",
           },
+          ...WRITE_SAFETY_PROPERTIES,
         },
         required: ["course_id", "title"],
       },
@@ -466,6 +506,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "number",
             description: "Position within the assignment group.",
           },
+          ...WRITE_SAFETY_PROPERTIES,
         },
         required: ["course_id", "name"],
       },
@@ -546,8 +587,413 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             enum: ["grading", "bookmark"],
             description: "Purpose of the rubric association.",
           },
+          ...WRITE_SAFETY_PROPERTIES,
         },
         required: ["course_id", "title"],
+      },
+    },
+    {
+      name: "create_course",
+      description: "Create a new Canvas course in an account. Requires account-level permissions.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          account_id: { type: ["string", "number"], description: "Canvas account ID." },
+          name: { type: "string", description: "Course name." },
+          course_code: { type: "string", description: "Short course code." },
+          start_at: { type: "string", description: "ISO 8601 course start date." },
+          end_at: { type: "string", description: "ISO 8601 course end date." },
+          syllabus_body: { type: "string", description: "HTML syllabus body." },
+          default_view: { type: "string", enum: ["feed", "wiki", "modules", "syllabus", "assignments"], description: "Canvas course home view." },
+          is_public: { type: "boolean" },
+          public_syllabus: { type: "boolean" },
+          restrict_enrollments_to_course_dates: { type: "boolean" },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["account_id", "name"],
+      },
+    },
+    {
+      name: "update_course",
+      description: "Update core Canvas course settings.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"], description: "Canvas course ID." },
+          fields: { type: "object", description: "Course fields to update, using snake_case Canvas names." },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "fields"],
+      },
+    },
+    {
+      name: "list_assignment_groups",
+      description: "List assignment groups in a course.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          include: { type: "array", items: { type: "string" } },
+        },
+        required: ["course_id"],
+      },
+    },
+    {
+      name: "create_assignment_group",
+      description: "Create an assignment group in a course.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          name: { type: "string" },
+          position: { type: "number" },
+          group_weight: { type: "number" },
+          sis_source_id: { type: "string" },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "name"],
+      },
+    },
+    {
+      name: "update_assignment_group",
+      description: "Update an assignment group.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          assignment_group_id: { type: ["string", "number"] },
+          fields: { type: "object", description: "Assignment group fields to update." },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "assignment_group_id", "fields"],
+      },
+    },
+    {
+      name: "update_module",
+      description: "Update a Canvas module.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          module_id: { type: ["string", "number"] },
+          fields: { type: "object", description: "Module fields to update." },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "module_id", "fields"],
+      },
+    },
+    {
+      name: "delete_module",
+      description: "Delete a Canvas module.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          module_id: { type: ["string", "number"] },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "module_id"],
+      },
+    },
+    {
+      name: "update_module_item",
+      description: "Update an item inside a Canvas module.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          module_id: { type: ["string", "number"] },
+          item_id: { type: ["string", "number"] },
+          fields: { type: "object", description: "Module item fields to update." },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "module_id", "item_id", "fields"],
+      },
+    },
+    {
+      name: "delete_module_item",
+      description: "Delete an item from a Canvas module.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          module_id: { type: ["string", "number"] },
+          item_id: { type: ["string", "number"] },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "module_id", "item_id"],
+      },
+    },
+    {
+      name: "build_course_shell",
+      description: "Create an ordered course skeleton from modules, assignment groups, and starter pages.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          assignment_groups: { type: "array", items: { type: "object" } },
+          pages: { type: "array", items: { type: "object" } },
+          modules: { type: "array", items: { type: "object" } },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id"],
+      },
+    },
+    {
+      name: "list_pages",
+      description: "List Canvas course pages.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          search_term: { type: "string" },
+          include: { type: "array", items: { type: "string", enum: ["body"] } },
+        },
+        required: ["course_id"],
+      },
+    },
+    {
+      name: "get_page",
+      description: "Get a Canvas page by URL slug or page_id:<id>.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          url_or_id: { type: ["string", "number"] },
+        },
+        required: ["course_id", "url_or_id"],
+      },
+    },
+    {
+      name: "update_page",
+      description: "Update a Canvas page.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          url_or_id: { type: ["string", "number"] },
+          fields: { type: "object", description: "Page fields to update." },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "url_or_id", "fields"],
+      },
+    },
+    {
+      name: "set_front_page",
+      description: "Update/create the course front page.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          title: { type: "string" },
+          body: { type: "string" },
+          published: { type: "boolean" },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "title", "body"],
+      },
+    },
+    {
+      name: "get_brand_variables",
+      description: "Read Canvas brand variables for a course, account, or current domain.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          account_id: { type: ["string", "number"] },
+        },
+      },
+    },
+    {
+      name: "create_branded_page",
+      description: "Create a Canvas page from structured sections and brand guideline tokens.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          title: { type: "string" },
+          subtitle: { type: "string" },
+          guidelines: { type: "object" },
+          sections: { type: "array", items: { type: "object" } },
+          published: { type: "boolean" },
+          front_page: { type: "boolean" },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "title", "sections"],
+      },
+    },
+    {
+      name: "get_quiz",
+      description: "Get a single classic Canvas quiz.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          quiz_id: { type: ["string", "number"] },
+        },
+        required: ["course_id", "quiz_id"],
+      },
+    },
+    {
+      name: "create_quiz",
+      description: "Create a classic Canvas quiz.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          title: { type: "string" },
+          quiz_type: { type: "string", enum: ["practice_quiz", "assignment", "graded_survey", "survey"] },
+          description: { type: "string" },
+          assignment_group_id: { type: "number" },
+          time_limit: { type: "number" },
+          allowed_attempts: { type: "number" },
+          due_at: { type: "string" },
+          unlock_at: { type: "string" },
+          lock_at: { type: "string" },
+          published: { type: "boolean" },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "title"],
+      },
+    },
+    {
+      name: "update_quiz",
+      description: "Update a classic Canvas quiz.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          quiz_id: { type: ["string", "number"] },
+          fields: { type: "object", description: "Quiz fields to update." },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "quiz_id", "fields"],
+      },
+    },
+    {
+      name: "delete_quiz",
+      description: "Delete a classic Canvas quiz.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          quiz_id: { type: ["string", "number"] },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "quiz_id"],
+      },
+    },
+    {
+      name: "list_quiz_questions",
+      description: "List questions in a classic Canvas quiz.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          quiz_id: { type: ["string", "number"] },
+        },
+        required: ["course_id", "quiz_id"],
+      },
+    },
+    {
+      name: "create_quiz_question",
+      description: "Create a question in a classic Canvas quiz.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          quiz_id: { type: ["string", "number"] },
+          question: { type: "object", description: "Canvas quiz question fields." },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "quiz_id", "question"],
+      },
+    },
+    {
+      name: "update_quiz_question",
+      description: "Update a question in a classic Canvas quiz.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          quiz_id: { type: ["string", "number"] },
+          question_id: { type: ["string", "number"] },
+          question: { type: "object", description: "Question fields to update." },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "quiz_id", "question_id", "question"],
+      },
+    },
+    {
+      name: "delete_quiz_question",
+      description: "Delete a question from a classic Canvas quiz.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          quiz_id: { type: ["string", "number"] },
+          question_id: { type: ["string", "number"] },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "quiz_id", "question_id"],
+      },
+    },
+    {
+      name: "reorder_quiz_items",
+      description: "Reorder questions or groups in a classic Canvas quiz.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          quiz_id: { type: ["string", "number"] },
+          order: { type: "array", items: { type: "object" } },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "quiz_id", "order"],
+      },
+    },
+    {
+      name: "list_submissions",
+      description: "List assignment submissions, optionally including user and rubric data.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          assignment_id: { type: ["string", "number"] },
+          include: { type: "array", items: { type: "string" } },
+        },
+        required: ["course_id", "assignment_id"],
+      },
+    },
+    {
+      name: "get_submission",
+      description: "Get one assignment submission by user ID.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          assignment_id: { type: ["string", "number"] },
+          user_id: { type: ["string", "number"] },
+          include: { type: "array", items: { type: "string" } },
+        },
+        required: ["course_id", "assignment_id", "user_id"],
+      },
+    },
+    {
+      name: "grade_submission_with_rubric",
+      description: "Grade a text-entry or URL submission with rubric row scores and comments.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: ["string", "number"] },
+          assignment_id: { type: ["string", "number"] },
+          user_id: { type: ["string", "number"] },
+          posted_grade: { type: "string" },
+          text_comment: { type: "string" },
+          rubric_assessment: { type: "array", items: { type: "object" } },
+          ...WRITE_SAFETY_PROPERTIES,
+        },
+        required: ["course_id", "assignment_id", "user_id", "rubric_assessment"],
       },
     },
   ],
@@ -558,9 +1004,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 // -----------------------------------------------------------------------
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args = {} } = request.params;
+  const { name, arguments: rawArgs = {} } = request.params;
+  const startedAt = Date.now();
+  let args: Record<string, unknown> = {};
+  let auditStatus: "success" | "error" = "success";
+  let auditError: unknown;
 
   try {
+    args = normalizeToolArguments(rawArgs);
+    if (!isKnownTool(name)) {
+      auditStatus = "error";
+      auditError = new Error(`Unknown tool: ${name}`);
+      return {
+        content: [{ type: "text", text: `Unknown tool: ${name}` }],
+        isError: true,
+      };
+    }
+
+    const safetyDecision = enforceSafety(name, args, safetyConfig);
+    if (safetyDecision.dryRun) {
+      return json(dryRunResult(name, args));
+    }
+
+    const canvas = canvasFor(args);
+
     switch (name) {
       // ── READ ──────────────────────────────────────────────────────────
 
@@ -728,6 +1195,285 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return json(result);
       }
 
+      case "create_course": {
+        const course = await canvas.createCourse(args.account_id as string | number, camelizeObject({
+          name: args.name,
+          course_code: args.course_code,
+          start_at: args.start_at,
+          end_at: args.end_at,
+          syllabus_body: args.syllabus_body,
+          default_view: args.default_view,
+          is_public: args.is_public,
+          public_syllabus: args.public_syllabus,
+          restrict_enrollments_to_course_dates: args.restrict_enrollments_to_course_dates,
+        }) as { name: string });
+        return json(course);
+      }
+
+      case "update_course": {
+        const course = await canvas.updateCourse(
+          args.course_id as string | number,
+          camelizeObject(assertObject(args.fields, "fields"))
+        );
+        return json(course);
+      }
+
+      case "list_assignment_groups": {
+        const groups = await canvas.listAssignmentGroups(args.course_id as string | number, {
+          include: args.include as string[] | undefined,
+        });
+        return json(groups);
+      }
+
+      case "create_assignment_group": {
+        const group = await canvas.createAssignmentGroup(args.course_id as string | number, camelizeObject({
+          name: args.name,
+          position: args.position,
+          group_weight: args.group_weight,
+          sis_source_id: args.sis_source_id,
+        }) as { name: string });
+        return json(group);
+      }
+
+      case "update_assignment_group": {
+        const group = await canvas.updateAssignmentGroup(
+          args.course_id as string | number,
+          args.assignment_group_id as string | number,
+          camelizeObject(assertObject(args.fields, "fields"))
+        );
+        return json(group);
+      }
+
+      case "update_module": {
+        const mod = await canvas.updateModule(
+          args.course_id as string | number,
+          args.module_id as string | number,
+          camelizeObject(assertObject(args.fields, "fields"))
+        );
+        return json(mod);
+      }
+
+      case "delete_module": {
+        const mod = await canvas.deleteModule(
+          args.course_id as string | number,
+          args.module_id as string | number
+        );
+        return json(mod);
+      }
+
+      case "update_module_item": {
+        const item = await canvas.updateModuleItem(
+          args.course_id as string | number,
+          args.module_id as string | number,
+          args.item_id as string | number,
+          camelizeObject(assertObject(args.fields, "fields"))
+        );
+        return json(item);
+      }
+
+      case "delete_module_item": {
+        const item = await canvas.deleteModuleItem(
+          args.course_id as string | number,
+          args.module_id as string | number,
+          args.item_id as string | number
+        );
+        return json(item);
+      }
+
+      case "build_course_shell": {
+        const result = await buildCourseShell(canvas, args);
+        return json(result);
+      }
+
+      case "list_pages": {
+        const pages = await canvas.listPages(args.course_id as string | number, {
+          searchTerm: args.search_term as string | undefined,
+          include: args.include as string[] | undefined,
+        });
+        return json(pages);
+      }
+
+      case "get_page": {
+        const page = await canvas.getPage(
+          args.course_id as string | number,
+          args.url_or_id as string | number
+        );
+        return json(page);
+      }
+
+      case "update_page": {
+        const page = await canvas.updatePage(
+          args.course_id as string | number,
+          args.url_or_id as string | number,
+          camelizeObject(assertObject(args.fields, "fields"))
+        );
+        return json(page);
+      }
+
+      case "set_front_page": {
+        const page = await canvas.setFrontPage(args.course_id as string | number, camelizeObject({
+          title: args.title,
+          body: args.body,
+          published: args.published,
+        }));
+        return json(page);
+      }
+
+      case "get_brand_variables": {
+        const variables = await canvas.getBrandVariables({
+          courseId: args.course_id as string | number | undefined,
+          accountId: args.account_id as string | number | undefined,
+        });
+        return json(variables);
+      }
+
+      case "create_branded_page": {
+        const pageInput: BrandedPageInput = {
+          title: args.title as string,
+          subtitle: args.subtitle as string | undefined,
+          guidelines: assertOptionalObject(args.guidelines),
+          sections: assertArray(args.sections, "sections") as BrandedPageInput["sections"],
+        };
+        const body = renderBrandedPage(pageInput);
+        const page = await canvas.createPage(args.course_id as string | number, {
+          title: pageInput.title,
+          body,
+          published: args.published as boolean | undefined,
+          frontPage: args.front_page as boolean | undefined,
+        });
+        return json(page);
+      }
+
+      case "get_quiz": {
+        const quiz = await canvas.getQuiz(
+          args.course_id as string | number,
+          args.quiz_id as string | number
+        );
+        return json(quiz);
+      }
+
+      case "create_quiz": {
+        const quiz = await canvas.createQuiz(args.course_id as string | number, camelizeObject({
+          title: args.title,
+          quiz_type: args.quiz_type,
+          description: args.description,
+          assignment_group_id: args.assignment_group_id,
+          time_limit: args.time_limit,
+          allowed_attempts: args.allowed_attempts,
+          due_at: args.due_at,
+          unlock_at: args.unlock_at,
+          lock_at: args.lock_at,
+          published: args.published,
+        }) as { title: string });
+        return json(quiz);
+      }
+
+      case "update_quiz": {
+        const quiz = await canvas.updateQuiz(
+          args.course_id as string | number,
+          args.quiz_id as string | number,
+          camelizeObject(assertObject(args.fields, "fields"))
+        );
+        return json(quiz);
+      }
+
+      case "delete_quiz": {
+        const quiz = await canvas.deleteQuiz(
+          args.course_id as string | number,
+          args.quiz_id as string | number
+        );
+        return json(quiz);
+      }
+
+      case "list_quiz_questions": {
+        const questions = await canvas.listQuizQuestions(
+          args.course_id as string | number,
+          args.quiz_id as string | number
+        );
+        return json(questions);
+      }
+
+      case "create_quiz_question": {
+        const question = await canvas.createQuizQuestion(
+          args.course_id as string | number,
+          args.quiz_id as string | number,
+          camelizeObject(assertObject(args.question, "question"))
+        );
+        return json(question);
+      }
+
+      case "update_quiz_question": {
+        const question = await canvas.updateQuizQuestion(
+          args.course_id as string | number,
+          args.quiz_id as string | number,
+          args.question_id as string | number,
+          camelizeObject(assertObject(args.question, "question"))
+        );
+        return json(question);
+      }
+
+      case "delete_quiz_question": {
+        const result = await canvas.deleteQuizQuestion(
+          args.course_id as string | number,
+          args.quiz_id as string | number,
+          args.question_id as string | number
+        );
+        return json(result ?? { deleted: true });
+      }
+
+      case "reorder_quiz_items": {
+        const result = await canvas.reorderQuizItems(
+          args.course_id as string | number,
+          args.quiz_id as string | number,
+          assertArray(args.order, "order") as Array<{ id: number; type?: "question" | "group" }>
+        );
+        return json(result ?? { reordered: true });
+      }
+
+      case "list_submissions": {
+        const submissions = await canvas.listSubmissions(
+          args.course_id as string | number,
+          args.assignment_id as string | number,
+          { include: args.include as string[] | undefined }
+        );
+        return json(submissions);
+      }
+
+      case "get_submission": {
+        const submission = await canvas.getSubmission(
+          args.course_id as string | number,
+          args.assignment_id as string | number,
+          args.user_id as string | number,
+          { include: args.include as string[] | undefined }
+        );
+        return json(submission);
+      }
+
+      case "grade_submission_with_rubric": {
+        const submission = await canvas.getSubmission(
+          args.course_id as string | number,
+          args.assignment_id as string | number,
+          args.user_id as string | number,
+          { include: ["assignment", "user", "rubric_assessment", "full_rubric_assessment"] }
+        );
+        if (!["online_text_entry", "online_url"].includes(String(submission.submission_type))) {
+          throw new Error(
+            `grade_submission_with_rubric only supports online_text_entry and online_url submissions in v1; received ${submission.submission_type ?? "none"}.`
+          );
+        }
+        const graded = await canvas.gradeSubmission(
+          args.course_id as string | number,
+          args.assignment_id as string | number,
+          args.user_id as string | number,
+          {
+            postedGrade: args.posted_grade as string | undefined,
+            textComment: args.text_comment as string | undefined,
+            rubricAssessment: normalizeRubricAssessment(args.rubric_assessment),
+          }
+        );
+        return json(graded);
+      }
+
       default:
         return {
           content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -735,11 +1481,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
     }
   } catch (err) {
+    auditStatus = "error";
+    auditError = err;
     const message = err instanceof Error ? err.message : String(err);
     return {
       content: [{ type: "text", text: `Error: ${message}` }],
       isError: true,
     };
+  } finally {
+    writeAuditEvent(createAuditEvent({
+      toolName: name,
+      arguments: args,
+      status: auditStatus,
+      durationMs: Date.now() - startedAt,
+      error: auditError,
+    }));
   }
 });
 
@@ -751,6 +1507,115 @@ function json(data: unknown) {
   return {
     content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
   };
+}
+
+function canvasFor(args: Record<string, unknown>): CanvasClient {
+  const token = resolveCanvasToken(args, safetyConfig);
+  if (!token) {
+    throw new Error(
+      "No Canvas API token is configured for this request. Set CANVAS_API_TOKEN or add a matching entry to CANVAS_API_TOKENS."
+    );
+  }
+
+  return new CanvasClient({ baseUrl: CANVAS_BASE_URL, token });
+}
+
+function assertObject(value: unknown, name: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${name} must be an object.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function assertOptionalObject(value: unknown): Record<string, string> | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return assertObject(value, "guidelines") as Record<string, string>;
+}
+
+function assertArray(value: unknown, name: string): unknown[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`${name} must be an array.`);
+  }
+  return value;
+}
+
+function camelizeObject(input: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(input)
+      .filter(([, value]) => value !== undefined)
+      .map(([key, value]) => [toCamelCase(key), value])
+  );
+}
+
+function toCamelCase(value: string): string {
+  return value.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+}
+
+function normalizeRubricAssessment(value: unknown) {
+  return assertArray(value, "rubric_assessment").map((row) => {
+    const obj = assertObject(row, "rubric_assessment row");
+    const criterionId = obj.criterion_id ?? obj.criterionId;
+    if (typeof criterionId !== "string" || criterionId.length === 0) {
+      throw new Error("Each rubric_assessment row requires criterion_id.");
+    }
+    if (obj.points === undefined && obj.rating_id === undefined && obj.ratingId === undefined && obj.comments === undefined) {
+      throw new Error(`Rubric row ${criterionId} requires points, rating_id, or comments.`);
+    }
+    return {
+      criterionId,
+      points: obj.points as number | undefined,
+      ratingId: (obj.rating_id ?? obj.ratingId) as string | undefined,
+      comments: obj.comments as string | undefined,
+    };
+  });
+}
+
+async function buildCourseShell(canvas: CanvasClient, args: Record<string, unknown>) {
+  const courseId = args.course_id as string | number;
+  const created: Record<string, unknown[]> = {
+    assignment_groups: [],
+    pages: [],
+    modules: [],
+    module_items: [],
+  };
+
+  for (const group of (args.assignment_groups as unknown[] | undefined) ?? []) {
+    const groupInput = camelizeObject(assertObject(group, "assignment group")) as { name: string };
+    created.assignment_groups.push(await canvas.createAssignmentGroup(courseId, groupInput));
+  }
+
+  const pageByTitle = new Map<string, { url?: string; page_id?: number }>();
+  for (const page of (args.pages as unknown[] | undefined) ?? []) {
+    const pageInput = camelizeObject(assertObject(page, "page"));
+    const createdPage = await canvas.createPage(courseId, {
+      title: pageInput.title as string,
+      body: pageInput.body as string | undefined,
+      published: pageInput.published as boolean | undefined,
+      frontPage: pageInput.frontPage as boolean | undefined,
+    });
+    pageByTitle.set(createdPage.title, createdPage);
+    created.pages.push(createdPage);
+  }
+
+  for (const mod of (args.modules as unknown[] | undefined) ?? []) {
+    const moduleInput = camelizeObject(assertObject(mod, "module"));
+    const items = (moduleInput.items as unknown[] | undefined) ?? [];
+    delete moduleInput.items;
+    const createdModule = await canvas.createModule(courseId, moduleInput as { name: string });
+    created.modules.push(createdModule);
+
+    for (const item of items) {
+      const itemInput = camelizeObject(assertObject(item, "module item"));
+      if (itemInput.type === "Page" && !itemInput.pageUrl && typeof itemInput.title === "string") {
+        itemInput.pageUrl = pageByTitle.get(itemInput.title)?.url;
+      }
+      created.module_items.push(await canvas.createModuleItem(courseId, createdModule.id, itemInput as { type: string }));
+    }
+  }
+
+  return created;
 }
 
 // -----------------------------------------------------------------------
