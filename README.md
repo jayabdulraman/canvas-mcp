@@ -16,6 +16,10 @@ that want AI-assisted course operations in Canvas.
 - **Scope today:** Course buildout, branded page authoring, classic quiz
   management, and text/URL submission grading workflows.
 
+### Demo
+
+[Watch demo](https://screen.studio/share/v7EvSqQz)
+
 ## Features
 
 ### Read tools
